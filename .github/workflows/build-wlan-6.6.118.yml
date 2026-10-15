@@ -86,6 +86,29 @@ jobs:
             echo "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
           } >> "$GITHUB_ENV"
 
+      - name: Make source archive sync robust on GitHub-hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          SYNC=".github/actions/kernel-source-sync/action.yml"
+          test -f "$SYNC"
+          grep -Fq 'MAX_WORKERS = (os.cpu_count() or 2) * 4' "$SYNC"
+          grep -Fq '/dev/shm/sync_' "$SYNC"
+          # The previous run downloaded CodeLinaro archive files into shared RAM
+          # while 16 tasks ran concurrently. Two large files were truncated.
+          # Move downloads to runner disk and limit simultaneous archive transfers.
+          sed -i \
+            -e 's|MAX_WORKERS = (os.cpu_count() or 2) \* 4|MAX_WORKERS = 3|' \
+            -e 's|/dev/shm/sync_|/tmp/op13-ddk-sync_|g' \
+            -e 's|aria2c -x16 -s16|aria2c -x4 -s4|g' \
+            -e 's|capture_output=not DEBUG|capture_output=False|g' \
+            "$SYNC"
+          grep -Fq 'MAX_WORKERS = 3' "$SYNC"
+          grep -Fq '/tmp/op13-ddk-sync_' "$SYNC"
+          ! grep -Fq '/dev/shm/sync_' "$SYNC"
+          echo "Source-sync download workspace moved to disk; concurrency limited to three"
+          df -h /tmp /dev/shm
+
       - name: Add receive-only monitor mode config in qcacld DDK
         shell: bash
         run: |
