@@ -97,27 +97,29 @@ jobs:
           source = path.read_text()
           anchor = "    - name: Prepare Bazel/DDK build\n"
           assert source.count(anchor) == 1, "Upstream DDK action changed; refuse unreviewed patch"
-          step = """    - name: Enable Qualcomm passive Monitor Mode
-      if: ${{ env.OP_DDK == 'true' && env.OP_DDK_INJECTION != 'true' }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        QCACLD="$CONFIG_FOLDER/vendor/qcom/opensource/wlan/qcacld-3.0"
-        test -d "$QCACLD" || { echo "::error::qcacld source missing"; exit 1; }
-        found=0
-        for f in "$QCACLD/configs/sun_gki_peach-v2_defconfig" "$QCACLD/configs/sun_consolidate_peach-v2_defconfig"; do
-          if [ -f "$f" ]; then
-            found=$((found + 1))
-            sed -i '/^# CONFIG_FEATURE_MONITOR_MODE_SUPPORT is not set/d' "$f"
-            sed -i '/^CONFIG_FEATURE_MONITOR_MODE_SUPPORT=/d' "$f"
-            echo 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y' >> "$f"
-            grep -qx 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y' "$f"
-            echo "Enabled passive monitor config: $f"
-          fi
-        done
-        [ "$found" -ge 1 ] || { echo "::error::No supported peach-v2 defconfig found"; exit 1; }
-
-    """
+          step = [
+              "    - name: Enable Qualcomm passive Monitor Mode",
+              "      if: ${{ env.OP_DDK == 'true' && env.OP_DDK_INJECTION != 'true' }}",
+              "      shell: bash",
+              "      run: |",
+              "        set -euo pipefail",
+              "        QCACLD=\"$CONFIG_FOLDER/vendor/qcom/opensource/wlan/qcacld-3.0\"",
+              "        test -d \"$QCACLD\" || { echo \"::error::qcacld source missing\"; exit 1; }",
+              "        found=0",
+              "        for f in \"$QCACLD/configs/sun_gki_peach-v2_defconfig\" \"$QCACLD/configs/sun_consolidate_peach-v2_defconfig\"; do",
+              "          if [ -f \"$f\" ]; then",
+              "            found=$((found + 1))",
+              "            sed -i '/^# CONFIG_FEATURE_MONITOR_MODE_SUPPORT is not set/d' \"$f\"",
+              "            sed -i '/^CONFIG_FEATURE_MONITOR_MODE_SUPPORT=/d' \"$f\"",
+              "            echo 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y' >> \"$f\"",
+              "            grep -qx 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y' \"$f\"",
+              "            echo \"Enabled passive monitor config: $f\"",
+              "          fi",
+              "        done",
+              "        [ \"$found\" -ge 1 ] || { echo \"::error::No supported peach-v2 defconfig found\"; exit 1; }",
+              "",
+          ]
+          step = "\n".join(step) + "\n"
           path.write_text(source.replace(anchor, step + anchor))
           print("Inserted passive receive-only monitor config step")
           PY
