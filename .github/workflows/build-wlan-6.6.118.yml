@@ -1,0 +1,234 @@
+name: OnePlus 13 6.6.118 WLAN Monitor DDK
+
+# Branch push starts the first build without requiring manual dispatch.
+# Builds a matching kernel only as a DDK build dependency; DO NOT flash it
+# or replace the phone's existing no-ds-dailyuse kernel without review.
+on:
+  push:
+    branches: [feature/wlan-ddk-monitor-66118]
+    paths:
+      - .github/workflows/build-wlan-6.6.118.yml
+      - wlan/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: op13-wlan-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build peach-v2 qcacld for OP13
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout pinned OnePlus 13 DDK-capable builder
+        uses: actions/checkout@v6
+        with:
+          repository: Hipuu/OnePlus13-KernelBuilder
+          ref: 9dbd2ebbb48297ea9a7cfefc14f4a515303c0eb7
+          persist-credentials: false
+
+      - name: Checkout original phone's ABI fingerprint
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: user-input
+          persist-credentials: false
+
+      - name: Verify the exact upstream builder and supported configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "9dbd2ebbb48297ea9a7cfefc14f4a515303c0eb7"
+          test -f .github/actions/build-kernel/action.yml
+          test -f .github/compatible-commits.json
+          jq -e '.ddk == true and .ddk_chipset == "peach-v2" and .ddk_target == "sun_perf" and .susfs == true' configs/OP13-6.6.118.json
+          test "$(wc -l < user-input/wlan/wlan-original-crc.txt)" -eq 588
+
+      - name: Install DDK build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            aria2 git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 python-is-python3 \
+            python3-requests ccache jq bc dos2unix kmod libdw-dev elfutils \
+            pigz zstd
+          sudo apt-get clean
+          df -h
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.ccache"
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_LOGFILE=$GITHUB_WORKSPACE/ccache.log"
+            echo "CCACHE_MAXSIZE=12G"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_COMPRESSION=true"
+            echo "CCACHE_COMPRESSION_LEVEL=3"
+            echo "CCACHE_DIRECT=true"
+            echo "CCACHE_FILE_CLONE=true"
+            echo "CCACHE_INODE_CACHE=true"
+            echo "CCACHE_IS_KERNEL_COMPILING=true"
+            echo "CCACHE_UMASK=002"
+            echo "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
+          } >> "$GITHUB_ENV"
+
+      - name: Make source archive sync robust on GitHub-hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          SYNC=".github/actions/kernel-source-sync/action.yml"
+          test -f "$SYNC"
+          grep -Fq 'MAX_WORKERS = (os.cpu_count() or 2) * 4' "$SYNC"
+          grep -Fq '/dev/shm/sync_' "$SYNC"
+          # The previous run downloaded CodeLinaro archive files into shared RAM
+          # while 16 tasks ran concurrently. Two large files were truncated.
+          # Move downloads to runner disk and limit simultaneous archive transfers.
+          sed -i \
+            -e 's|MAX_WORKERS = (os.cpu_count() or 2) \* 4|MAX_WORKERS = 3|' \
+            -e 's|/dev/shm/sync_|/tmp/op13-ddk-sync_|g' \
+            -e 's|aria2c -x16 -s16|aria2c -x4 -s4|g' \
+            -e 's|capture_output=not DEBUG|capture_output=False|g' \
+            "$SYNC"
+          grep -Fq 'MAX_WORKERS = 3' "$SYNC"
+          grep -Fq '/tmp/op13-ddk-sync_' "$SYNC"
+          ! grep -Fq '/dev/shm/sync_' "$SYNC"
+          echo "Source-sync download workspace moved to disk; concurrency limited to three"
+          df -h /tmp /dev/shm
+
+      - name: Add receive-only monitor mode config in qcacld DDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(".github/actions/build-kernel/action.yml")
+          source = path.read_text()
+          anchor = "    - name: Prepare Bazel/DDK build\n"
+          assert source.count(anchor) == 1, "Upstream DDK action changed; refuse unreviewed patch"
+          step = [
+              "    - name: Enable Qualcomm passive Monitor Mode",
+              "      if: ${{ env.OP_DDK == 'true' && env.OP_DDK_INJECTION != 'true' }}",
+              "      shell: bash",
+              "      run: |",
+              "        set -euo pipefail",
+              "        QCACLD=\"$CONFIG_FOLDER/vendor/qcom/opensource/wlan/qcacld-3.0\"",
+              "        test -d \"$QCACLD\" || { echo \"::error::qcacld source missing\"; exit 1; }",
+              "        found=0",
+              "        for f in \"$QCACLD/configs/sun_gki_peach-v2_defconfig\" \"$QCACLD/configs/sun_consolidate_peach-v2_defconfig\"; do",
+              "          if [ -f \"$f\" ]; then",
+              "            found=$((found + 1))",
+              "            sed -i '/^# CONFIG_FEATURE_MONITOR_MODE_SUPPORT is not set/d' \"$f\"",
+              "            sed -i '/^CONFIG_FEATURE_MONITOR_MODE_SUPPORT=/d' \"$f\"",
+              "            echo 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y' >> \"$f\"",
+              "            grep -qx 'CONFIG_FEATURE_MONITOR_MODE_SUPPORT=y' \"$f\"",
+              "            echo \"Enabled passive monitor config: $f\"",
+              "          fi",
+              "        done",
+              "        [ \"$found\" -ge 1 ] || { echo \"::error::No supported peach-v2 defconfig found\"; exit 1; }",
+              "",
+          ]
+          step = "\n".join(step) + "\n"
+          path.write_text(source.replace(anchor, step + anchor))
+          print("Inserted passive receive-only monitor config step")
+          PY
+
+      - name: Set A16 6.6.118 peach-v2 configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          config=$(jq -c '
+            .ddk = true |
+            .ddk_target = "sun_perf" |
+            .ddk_chipset = "peach-v2" |
+            .ddk_injection = true |
+            .nethunter = true |
+            .wireless_modules = false |
+            .ds = false |
+            .susfs = true |
+            .bore = false |
+            .lrng = false |
+            .battery_save = false |
+            .audit_off = false |
+            .lto = "thin" |
+            .zyc_compiler = "" |
+            .uname = "OP13-WLAN118"
+          ' configs/OP13-6.6.118.json)
+          echo "config_json=$config" >> "$GITHUB_OUTPUT"
+          echo "ksun_ref=$(jq -r '.ksu.dev' .github/compatible-commits.json)" >> "$GITHUB_OUTPUT"
+          echo "susfs_ref=$(jq -r '.susfs["android15-6.6"].KSUN' .github/compatible-commits.json)" >> "$GITHUB_OUTPUT"
+          jq . <<< "$config"
+
+      - name: Build Qualcomm module against one internally consistent kernel KMI
+        id: builder
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ steps.config.outputs.config_json }}
+          ksu_type: KSUN
+          ksu_branch_or_hash: ${{ steps.config.outputs.ksun_ref }}
+          susfs_commit_hash_or_branch: ${{ steps.config.outputs.susfs_ref }}
+          optimize_level: O2
+          clean: "false"
+          debug: "false"
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Analyze new module against original phone symbol CRCs
+        id: abi
+        shell: bash
+        if: success()
+        run: |
+          set -euo pipefail
+          ko="$(find "$GITHUB_WORKSPACE" -type f -path '*/artifacts/*' -name qca_cld3_peach_v2.ko -print -quit)"
+          if [ -z "$ko" ] && [ -n "${ARTIFACTS_FOLDER:-}" ]; then
+            ko="${ARTIFACTS_FOLDER}/qca_cld3_peach_v2.ko"
+          fi
+          test -s "$ko" || { echo "::error::No qcacld .ko staged"; exit 1; }
+          mkdir -p abi-report
+          set +e
+          python3 user-input/wlan/compare-wlan-abi.py user-input/wlan/wlan-original-crc.txt "$ko" \
+            > abi-report/compatibility.txt 2>&1
+          status=$?
+          set -e
+          cat abi-report/compatibility.txt
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::ABI not proven compatible with old no-ds-dailyuse kernel; do NOT replace its stock driver"
+          fi
+
+      - name: Upload phone ABI comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: op13-original-kernel-abi-comparison
+          path: abi-report/compatibility.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Build result note
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### OnePlus 13 WLAN DDK result"
+            echo "- Source: Hipuu builder pinned to 9dbd2ebbb48297ea9a7cfefc14f4a515303c0eb7"
+            echo "- Device: OP13 A16 kernel 6.6.118, peach-v2"
+            echo "- Active WLAN RX monitor support configured; frame injection patch disabled"
+            echo "- New qcacld module uploaded separately by the upstream composite action on success"
+            echo "- Static ABI comparison status: ${{ steps.abi.outputs.status }}"
+            echo "- No flashing is performed. A successful build does NOT guarantee compatibility with your unchanged no-ds-dailyuse Image."
+          } >> "$GITHUB_STEP_SUMMARY"
